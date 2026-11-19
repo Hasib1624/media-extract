@@ -8,3 +8,5 @@ python3 -m venv .venv && .venv/bin/python -m pip install yt-dlp
 ```
 
 See `extract.py --help`.
+
+If YouTube returns HTTP 429 on captions, add `--cookies-from-browser firefox`.

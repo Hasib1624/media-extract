@@ -8,7 +8,7 @@ Usage:
   extract.py --file urls.txt
 Output: <out_dir>/<id>.json and <id>.transcript.txt per URL (default ./out).
 """
-import argparse, json, re, sys, tempfile, urllib.request
+import argparse, json, re, sys, time, urllib.request
 from pathlib import Path
 
 try:
@@ -35,7 +35,7 @@ def vtt_to_text(vtt: str) -> str:
     return "\n".join(out)
 
 
-def get_transcript(info, lang):
+def get_transcript(info, lang, ydl):
     for source in ("subtitles", "automatic_captions"):
         tracks = info.get(source) or {}
         key = next((k for k in tracks if k == lang or k.startswith(lang + "-")), None)
@@ -43,19 +43,25 @@ def get_transcript(info, lang):
             continue
         fmt = next((f for f in tracks[key] if f.get("ext") == "vtt"), None)
         if fmt:
-            with urllib.request.urlopen(fmt["url"], timeout=30) as r:
-                return source, vtt_to_text(r.read().decode("utf-8", "replace"))
+            r = ydl.urlopen(fmt["url"])
+            return source, vtt_to_text(r.read().decode("utf-8", "replace"))
     return None, None
 
 
-def extract(url, out_dir, n_comments, want_transcript, lang):
+def extract(url, out_dir, n_comments, want_transcript, lang, browser=None):
     opts = {"quiet": True, "no_warnings": True, "skip_download": True,
             "noplaylist": True, "ignoreerrors": False}
+    if browser:
+        opts["cookiesfrombrowser"] = (browser,)
     if n_comments:
         opts["getcomments"] = True
         opts["extractor_args"] = {"youtube": {"max_comments": [str(n_comments)]}}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
+        return _finish(info, ydl, out_dir, n_comments, want_transcript, lang)
+
+
+def _finish(info, ydl, out_dir, n_comments, want_transcript, lang):
     data = {k: info.get(k) for k in FIELDS}
     if n_comments:
         data["comments"] = [
@@ -64,7 +70,16 @@ def extract(url, out_dir, n_comments, want_transcript, lang):
     out_dir.mkdir(parents=True, exist_ok=True)
     vid = re.sub(r"[^\w.-]", "_", str(info.get("id")))
     if want_transcript:
-        src, text = get_transcript(info, lang)
+        src, text = None, None
+        for attempt in range(3):
+            try:
+                src, text = get_transcript(info, lang, ydl)
+                break
+            except Exception as e:
+                data["transcript_error"] = str(e)
+                time.sleep(5 * (attempt + 1))
+        else:
+            print(f"warn {vid}: transcript failed ({data['transcript_error']})", file=sys.stderr)
         data["transcript_source"] = src
         if text:
             (out_dir / f"{vid}.transcript.txt").write_text(text, encoding="utf-8")
@@ -81,6 +96,7 @@ def main():
     ap.add_argument("--comments", type=int, default=0, metavar="N")
     ap.add_argument("--no-transcript", action="store_true")
     ap.add_argument("--lang", default="en")
+    ap.add_argument("--cookies-from-browser", metavar="BROWSER", help="e.g. firefox, chrome (helps with 429s / login-only posts)")
     a = ap.parse_args()
     urls = list(a.urls)
     if a.file:
@@ -88,9 +104,11 @@ def main():
     if not urls:
         ap.error("no URLs given")
     fails = 0
-    for u in urls:
+    for i, u in enumerate(urls):
+        if i:
+            time.sleep(3)
         try:
-            vid, d = extract(u, Path(a.out), a.comments, not a.no_transcript, a.lang)
+            vid, d = extract(u, Path(a.out), a.comments, not a.no_transcript, a.lang, a.cookies_from_browser)
             print(f"OK   {vid}  {d['title']!r}  transcript={d.get('transcript_source')}")
         except Exception as e:
             fails += 1
